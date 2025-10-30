@@ -18,4 +18,4 @@ streamlit run app.py
 - COURSES.csv
 - ClassesAndLessons.csv
 
-Each generated automatically from your uploads based on Compass-style mappings.
+Each generated automatically from your uploads based on your finalized mappings.
