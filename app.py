@@ -17,8 +17,22 @@ st.caption("Upload your source spreadsheets on one page, then download a single 
 def _read_any(file) -> pd.DataFrame:
     name = file.name.lower()
     if name.endswith(".csv"):
-        return pd.read_csv(file)
-    return pd.read_excel(file)
+        # Auto-detect delimiter
+        try:
+            return pd.read_csv(file, sep=None, engine="python")
+        except Exception:
+            file.seek(0)
+            return pd.read_csv(file)
+    # Excel: pick the first non-empty sheet
+    xls = pd.ExcelFile(file)
+    best_df = None
+    max_rows = -1
+    for sheet in xls.sheet_names:
+        df = pd.read_excel(xls, sheet_name=sheet)
+        rows = int(df.shape[0])
+        if rows > max_rows and df.dropna(how="all").shape[0] > 0:
+            best_df, max_rows = df, rows
+    return best_df if best_df is not None else pd.read_excel(file)
 
 def _infer_year_from_name(name: str) -> str:
     s = name.lower()
@@ -56,34 +70,61 @@ def _map_rotation(v: Any) -> str:
     labels = [term_map.get(p, p) for p in parts]
     return ", ".join(sorted(set(labels))) if labels else "WHOLE YEAR"
 
+def _norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", s.lower())
+
 def _pick(df: pd.DataFrame, candidates: List[str]):
-    lower_map = {c.lower(): c for c in df.columns}
+    # Try exact, case-insensitive, then contains-based fuzzy match.
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return None
+    cols = list(df.columns)
+    lower_map = {c.lower(): c for c in cols}
     for c in candidates:
-        if c in df.columns: return c
-        if c.lower() in lower_map: return lower_map[c.lower()]
+        if c in cols:
+            return c
+    for c in candidates:
+        if c.lower() in lower_map:
+            return lower_map[c.lower()]
+    norm_map = {_norm(c): c for c in cols}
+    for c in candidates:
+        key = _norm(c)
+        for nkey, orig in norm_map.items():
+            if key and key in nkey:
+                return orig
+    for orig in cols:
+        n = _norm(orig)
+        if any(_norm(c) in n for c in candidates):
+            return orig
     return None
+
+def _series(df: pd.DataFrame, src_col: str, default: str = "") -> pd.Series:
+    if src_col and src_col in df.columns:
+        return df[src_col].astype(str)
+    return pd.Series([default] * len(df), index=df.index, dtype="object")
 
 # ------------------------------
 # Conversions (your finalized specs)
 # ------------------------------
 def build_rooms(df: pd.DataFrame) -> pd.DataFrame:
-    out = pd.DataFrame()
-    out["RoomCode"] = df.get("Code", "")
-    out["RoomName"] = df.get("Notes", "")
-    cap = pd.to_numeric(df.get("Size", pd.Series([None]*len(df))), errors="coerce").fillna(0).astype(int)
+    out = pd.DataFrame(index=df.index)
+    out["RoomCode"] = _series(df, _pick(df, ["Code"]))
+    out["RoomName"] = _series(df, _pick(df, ["Notes"]))
+    size_col = _pick(df, ["Size"])
+    cap = pd.to_numeric(df.get(size_col, pd.Series([None]*len(df), index=df.index)), errors="coerce").fillna(0).astype(int)
     out["Capacity"] = cap
     return out[["RoomCode","RoomName","Capacity"]]
 
 def build_teachers(df: pd.DataFrame, target_cols: List[str]) -> pd.DataFrame:
-    out = pd.DataFrame(columns=target_cols)
-    out.loc[:, "TeacherCode"] = df.get("Code", "")
-    if "Name" in df.columns:
-        first, last = zip(*df["Name"].map(_split_name))
-        out.loc[:, "FirstName"] = pd.Series(first)
-        out.loc[:, "LastName"] = pd.Series(last)
-    out.loc[:, "FacultyCode"] = df.get("Faculty", "")
-    if "HomeSpace" in out.columns: out.loc[:, "HomeSpace"] = ""
-    if "LearningSupport" in out.columns: out.loc[:, "LearningSupport"] = ""
+    out = pd.DataFrame(index=df.index, columns=target_cols)
+    out["TeacherCode"] = _series(df, _pick(df, ["Code"]))
+    name_col = _pick(df, ["Name"])
+    if name_col:
+        first, last = zip(*df[name_col].map(_split_name))
+        out["FirstName"] = pd.Series(first, index=df.index, dtype="object")
+        out["LastName"]  = pd.Series(last,  index=df.index, dtype="object")
+    out["FacultyCode"] = _series(df, _pick(df, ["Faculty"]))
+    out["HomeSpace"] = ""
+    out["LearningSupport"] = ""
     return out
 
 def build_students(files: List[Any], target_cols: List[str]) -> pd.DataFrame:
@@ -91,19 +132,20 @@ def build_students(files: List[Any], target_cols: List[str]) -> pd.DataFrame:
     for f in files:
         df = _read_any(f)
         yl = _infer_year_from_name(f.name)
-        out = pd.DataFrame(columns=target_cols)
-        out.loc[:, "StudentCode"] = df.get("Code", "")
-        if "Name" in df.columns:
-            first, last = zip(*df["Name"].map(_split_name))
-            out.loc[:, "FirstName"] = pd.Series(first)
-            out.loc[:, "LastName"] = pd.Series(last)
-        letter = df.get("Letter") if "Letter" in df.columns else df.get("CoreStudentBodyCode", "")
-        if "CoreStudentBodyCode" in out.columns: out.loc[:, "CoreStudentBodyCode"] = letter
-        if "YearLevelCode" in out.columns: out.loc[:, "YearLevelCode"] = yl
-        if "YearLevel" in out.columns: out.loc[:, "YearLevel"] = yl
-        if "Curriculum" in out.columns: out.loc[:, "Curriculum"] = yl
-        if "Gender" in out.columns: out.loc[:, "Gender"] = ""
-        if "Email" in out.columns: out.loc[:, "Email"] = df.get("Email", "")
+        out = pd.DataFrame(index=df.index, columns=target_cols)
+        out["StudentCode"] = _series(df, _pick(df, ["Code"]))
+        name_col = _pick(df, ["Name"])
+        if name_col:
+            first, last = zip(*df[name_col].map(_split_name))
+            out["FirstName"] = pd.Series(first, index=df.index, dtype="object")
+            out["LastName"]  = pd.Series(last,  index=df.index, dtype="object")
+        letter_col = _pick(df, ["Letter","CoreStudentBodyCode"])
+        out["CoreStudentBodyCode"] = _series(df, letter_col)
+        out["YearLevelCode"] = yl
+        out["YearLevel"] = yl
+        out["Curriculum"] = yl
+        out["Gender"] = ""
+        out["Email"] = _series(df, _pick(df, ["Email","E-mail","Email Address"]))
         frames.append(out)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=target_cols)
 
@@ -111,13 +153,17 @@ def build_class_memberships(files: List[Any]) -> pd.DataFrame:
     rows = []
     for f in files:
         df = _read_any(f)
-        if "Code" not in df.columns: continue
-        class_cols = [c for c in df.columns if re.match(r"(?i)^class\s*_?\s*\d+", str(c).replace(" ", ""))]
+        code_col = _pick(df, ["Code","StudentCode"])
+        if not code_col:
+            continue
+        class_cols = [c for c in df.columns if re.match(r"(?i)^class[\s_]*\d+$", str(c).strip().replace(" ", "_"))]
         if not class_cols:
-            class_cols = [c for c in df.columns if str(c).strip().lower().startswith("class")]
-        long = df[["Code"] + class_cols].melt(id_vars=["Code"], var_name="src", value_name="ClassCode")
+            class_cols = [c for c in df.columns if _norm("class") in _norm(str(c))]
+        if not class_cols:
+            continue
+        long = df[[code_col] + class_cols].melt(id_vars=[code_col], var_name="src", value_name="ClassCode")
         long = long[long["ClassCode"].notna() & (long["ClassCode"].astype(str).str.strip() != "")]
-        long["StudentCode"] = long["Code"].astype(str)
+        long["StudentCode"] = long[code_col].astype(str)
         rows.append(long[["StudentCode","ClassCode"]])
     return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["StudentCode","ClassCode"])
 
@@ -126,31 +172,30 @@ def build_courses(files: List[Any], target_cols: List[str]) -> pd.DataFrame:
     for f in files:
         df = _read_any(f)
         yr = _infer_year_from_name(f.name)
-        tmp = pd.DataFrame(columns=target_cols)
+        tmp = pd.DataFrame(index=df.index, columns=target_cols)
         cand_course = _pick(df, ["Course","CourseCode","Course Code"])
         cand_subject = _pick(df, ["Subject","CourseName","Course Name"])
         cand_faculty = _pick(df, ["Faculty","SubjectCode","Subject Code"])
         cand_rot = _pick(df, ["Rot","Rotation","RotationSet","Rotation Set"])
         cand_line = _pick(df, ["Line","Type"])
-        tmp.loc[:, "CourseCode"] = df[cand_course].astype(str) if cand_course else ""
-        tmp.loc[:, "CourseName"] = df[cand_subject].astype(str) if cand_subject else ""
-        tmp.loc[:, "CurriculumName"] = yr
-        tmp.loc[:, "SubjectCode"] = df[cand_faculty].astype(str) if cand_faculty else ""
-        tmp.loc[:, "RotationSet"] = (df[cand_rot] if cand_rot else pd.Series([None]*len(df))).map(_map_rotation)
-        tmp.loc[:, "Type"] = (df[cand_line] if cand_line else pd.Series([None]*len(df))).map(
-            lambda x: "Core" if str(x).strip().lower().startswith("group") else "Elective"
-        )
+        tmp["CourseCode"] = _series(df, cand_course)
+        tmp["CourseName"] = _series(df, cand_subject)
+        tmp["CurriculumName"] = yr
+        tmp["SubjectCode"] = _series(df, cand_faculty)
+        tmp["RotationSet"] = _series(df, cand_rot).map(_map_rotation)
+        tmp["Type"] = _series(df, cand_line).map(lambda x: "Core" if str(x).strip().lower().startswith("group") else "Elective")
         frames.append(tmp)
     out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=target_cols)
-    out = out[out["CourseCode"].astype(str).str.strip() != ""].drop_duplicates(subset=["CourseCode"], keep="first")
-    return out[target_cols]
+    if "CourseCode" in out.columns:
+        out = out[out["CourseCode"].astype(str).str.strip() != ""].drop_duplicates(subset=["CourseCode"], keep="first")
+    return out[target_cols] if not out.empty else out
 
 def build_classes_and_lessons(df: pd.DataFrame, courses_df: pd.DataFrame) -> pd.DataFrame:
     target_cols = ["PeriodCode","CourseCode","ClassIdentifier","TeacherCode","RoomCode","Rotation"]
-    out = pd.DataFrame(columns=target_cols)
+    out = pd.DataFrame(index=df.index, columns=target_cols)
     cday = _pick(df, ["Day","DAY","day","DayName"])
     cper = _pick(df, ["Period","PERIOD","period","Per"])
-    out.loc[:, "PeriodCode"] = (df.get(cday, "").astype(str).str.strip() + df.get(cper, "").astype(str).str.strip()) if cday and cper else ""
+    out["PeriodCode"] = (_series(df, cday, "") + _series(df, cper, ""))
     cclass = _pick(df, ["Class","ClassCode","Class Code","ClassIdentifier","Class Identifier"])
     cteach = _pick(df, ["TeacherCode","Teacher Code","Teacher","StaffCode","Staff Code","Staff"])
     croom = _pick(df, ["RoomCode","Room Code","Room","Rm","RM"])
@@ -165,16 +210,16 @@ def build_classes_and_lessons(df: pd.DataFrame, courses_df: pd.DataFrame) -> pd.
                 return code, rem
         return "", s
     if cclass:
-        cc, ident = zip(*df[cclass].map(split_class))
-        out.loc[:, "CourseCode"] = pd.Series(cc, dtype=str)
-        out.loc[:, "ClassIdentifier"] = pd.Series(ident, dtype=str)
+        cc, ident = zip(*_series(df, cclass, "").map(split_class))
+        out["CourseCode"] = pd.Series(cc, index=df.index, dtype="object")
+        out["ClassIdentifier"] = pd.Series(ident, index=df.index, dtype="object")
     else:
-        out.loc[:, "CourseCode"] = ""
-        out.loc[:, "ClassIdentifier"] = ""
-    out.loc[:, "TeacherCode"] = df.get(cteach, "")
-    out.loc[:, "RoomCode"] = df.get(croom, "")
-    rot_lookup = courses_df.set_index("CourseCode").get("RotationSet", pd.Series(dtype=str))
-    out.loc[:, "Rotation"] = out["CourseCode"].map(rot_lookup).fillna(df.get(crot, ""))
+        out["CourseCode"] = ""
+        out["ClassIdentifier"] = ""
+    out["TeacherCode"] = _series(df, cteach, "")
+    out["RoomCode"]    = _series(df, croom, "")
+    rot_lookup = courses_df.set_index("CourseCode")["RotationSet"] if (not courses_df.empty and "CourseCode" in courses_df.columns and "RotationSet" in courses_df.columns) else pd.Series(dtype=str)
+    out["Rotation"] = out["CourseCode"].map(rot_lookup).fillna(_series(df, crot, ""))
     return out[target_cols]
 
 # ------------------------------
@@ -192,6 +237,8 @@ with col2:
     f_classes = st.file_uploader("Classes & Lessons spreadsheet", type=["csv","xlsx","xls"], key="classes")
 
 st.subheader("2) Build outputs & download ZIP")
+diagnostics = st.expander("🔎 Diagnostics (matched columns & row counts)")
+
 if st.button("🧰 Build all files"):
     outputs: Dict[str, bytes] = {}
 
@@ -201,6 +248,7 @@ if st.button("🧰 Build all files"):
         rooms = build_rooms(df_room)
         outputs["ROOM.csv"] = rooms.to_csv(index=False).encode("utf-8")
         st.success(f"ROOM.csv ✓ ({len(rooms)} rows)")
+        diagnostics.write({"rooms_rows": len(rooms), "room_cols": list(rooms.columns)})
 
     # Teachers
     if f_teacher is not None:
@@ -209,6 +257,7 @@ if st.button("🧰 Build all files"):
         teachers = build_teachers(df_teacher, teacher_cols)
         outputs["Teacher.csv"] = teachers.to_csv(index=False).encode("utf-8")
         st.success(f"Teacher.csv ✓ ({len(teachers)} rows)")
+        diagnostics.write({"teachers_rows": len(teachers), "teacher_cols": list(teachers.columns)})
 
     # Courses (must be ready before Classes & Lessons)
     courses_df = pd.DataFrame(columns=["CourseCode","CourseName","CurriculumName","SubjectCode","Type","RotationSet"])
@@ -216,6 +265,7 @@ if st.button("🧰 Build all files"):
         courses_df = build_courses(f_courses, list(courses_df.columns))
         outputs["COURSES.csv"] = courses_df.to_csv(index=False).encode("utf-8")
         st.success(f"COURSES.csv ✓ ({len(courses_df)} rows)")
+        diagnostics.write({"courses_rows": len(courses_df), "course_cols": list(courses_df.columns)})
 
     # Students + Class Memberships from same uploads
     if f_students:
@@ -225,10 +275,12 @@ if st.button("🧰 Build all files"):
         students = build_students(f_students, student_cols)
         outputs["Student.csv"] = students.to_csv(index=False).encode("utf-8")
         st.success(f"Student.csv ✓ ({len(students)} rows)")
+        diagnostics.write({"students_rows": len(students), "student_cols": list(students.columns)})
 
         memberships = build_class_memberships(f_students)
         outputs["ClassMemberships.csv"] = memberships.to_csv(index=False).encode("utf-8")
         st.success(f"ClassMemberships.csv ✓ ({len(memberships)} rows)")
+        diagnostics.write({"class_membership_rows": len(memberships), "class_membership_cols": list(memberships.columns)})
 
     # Classes & Lessons (requires courses for rotation lookup)
     if f_classes is not None:
@@ -236,11 +288,13 @@ if st.button("🧰 Build all files"):
         classes_out = build_classes_and_lessons(df_classes, courses_df)
         outputs["ClassesAndLessons.csv"] = classes_out.to_csv(index=False).encode("utf-8")
         st.success(f"ClassesAndLessons.csv ✓ ({len(classes_out)} rows)")
+        diagnostics.write({"classes_rows": len(classes_out), "classes_cols": list(classes_out.columns)})
 
     # Subjects (static include)
     if f_subjects is not None:
         outputs["SUBJECT.csv"] = f_subjects.read()
         st.success("SUBJECT.csv ✓ (included as-is)")
+        diagnostics.write({"subjects_bytes": "included"})
 
     if not outputs:
         st.warning("Please upload at least one source file.")
@@ -256,4 +310,4 @@ if st.button("🧰 Build all files"):
             mime="application/zip",
         )
 
-st.caption("Single-page app: upload everything once and download a ZIP of ROOM, Teacher, Student, ClassMemberships, SUBJECT, COURSES, and ClassesAndLessons outputs.")
+st.caption("Robust reading + fuzzy matching. If something looks empty, open Diagnostics to see matched columns and row counts.")

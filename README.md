@@ -1,6 +1,12 @@
-# School Data Transformer
+# School Data Transformer (Robust)
 
-A single-page Streamlit app for uploading multiple school-related spreadsheets (Rooms, Teachers, Students, Courses, Subjects, and Classes & Lessons) and downloading all processed outputs as one ZIP bundle.
+A single-page Streamlit app for uploading school spreadsheets and downloading all processed outputs as one ZIP bundle.
+
+This version adds:
+- Auto-detected CSV delimiters and Excel sheet selection
+- Fuzzy column matching (case-insensitive, contains-based)
+- Diagnostics expander showing row counts and matched columns
+- Safer fallbacks so outputs aren't empty if column names differ slightly
 
 ## Quickstart
 
@@ -8,14 +14,3 @@ A single-page Streamlit app for uploading multiple school-related spreadsheets (
 pip install -r requirements.txt
 streamlit run app.py
 ```
-
-## Outputs
-- ROOM.csv
-- Teacher.csv
-- Student.csv
-- ClassMemberships.csv
-- SUBJECT.csv
-- COURSES.csv
-- ClassesAndLessons.csv
-
-Each generated automatically from your uploads based on your finalized mappings.
